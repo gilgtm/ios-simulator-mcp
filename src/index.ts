@@ -45,6 +45,10 @@ const WDA_BUILD_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 const WDA_START_TIMEOUT_MS = 10_000;
 const WDA_STATUS_POLL_INTERVAL_MS = 100;
 const WDA_PORT_SEARCH_LIMIT = 100;
+const VIDEO_CODEC_VALUES = ["h264", "hevc"] as const;
+const DEFAULT_RECORDING_CODEC = "hevc";
+const DEFAULT_STOP_RECORDING_SCALE = 0.5;
+const DEFAULT_STOP_RECORDING_OUTPUT_CODEC = "hevc";
 const parsedWdaPort = Number.parseInt(
   process.env.IOS_SIMULATOR_MCP_WDA_PORT ?? "",
   10
@@ -54,7 +58,7 @@ const wdaPortsByDeviceId = new Map<string, number>();
 const activeRecordingsByUdid = new Map<string, ActiveRecording>();
 const recordingStartupReservationsByUdid = new Set<string>();
 let wdaPortLock = Promise.resolve();
-let swiftVideoRotationScriptPath: string | null = null;
+let swiftVideoTranscodeScriptPath: string | null = null;
 const ERROR_SUMMARY_MAX_CHARS = 300;
 const RECORDING_START_TIMEOUT_MS = 3000;
 const RECORDING_STOP_FINALIZATION_TIMEOUT_MS = 3000;
@@ -228,11 +232,13 @@ type SimctlListDevicesResponse = {
 };
 
 type RotationAngle = -90 | 0 | 90 | 180;
+type VideoCodec = (typeof VIDEO_CODEC_VALUES)[number];
 
 type ActiveRecording = {
   outputFile: string;
   process: ChildProcessWithoutNullStreams;
   startRotationAngle: RotationAngle | null;
+  codec: VideoCodec;
 };
 
 type BootedDeviceDetails = BootedDevice & {
@@ -320,11 +326,13 @@ type OrientationProbe = {
   point: UiPoint;
 };
 
-type VideoRotationMethod = "ffmpeg" | "swift";
+type VideoPostProcessMethod = "ffmpeg" | "swift";
 
-type VideoRotationResult = {
+type VideoPostProcessResult = {
   applied: boolean;
-  method?: VideoRotationMethod;
+  changes: string[];
+  outputCodec: VideoCodec;
+  method?: VideoPostProcessMethod;
   note?: string;
 };
 
@@ -1063,29 +1071,105 @@ function getFfmpegRotationFilter(rotationAngle: RotationAngle): string | null {
   }
 }
 
-const SWIFT_VIDEO_ROTATION_SCRIPT = String.raw`import Foundation
+function getFfmpegScaleFilter(scale: number): string | null {
+  if (scale === 1) {
+    return null;
+  }
+
+  const scaleFactor = String(scale);
+  return `scale=ceil(iw*${scaleFactor}/2)*2:ceil(ih*${scaleFactor}/2)*2`;
+}
+
+function getFfmpegVideoFilter(
+  rotationAngle: RotationAngle,
+  scale: number
+): string | null {
+  const filters = [
+    getFfmpegRotationFilter(rotationAngle),
+    getFfmpegScaleFilter(scale),
+  ].filter((filter): filter is string => filter !== null);
+
+  return filters.length > 0 ? filters.join(",") : null;
+}
+
+function getFfmpegVideoCodecArgs(codec: VideoCodec): string[] {
+  if (codec === "hevc") {
+    return ["-c:v", "libx265", "-tag:v", "hvc1", "-crf", "18"];
+  }
+
+  return ["-c:v", "libx264", "-crf", "18"];
+}
+
+function describeVideoCodec(codec: VideoCodec): string {
+  return codec === "hevc" ? "HEVC/H.265" : "H.264";
+}
+
+function formatScalePercentage(scale: number): string {
+  const percentage = Number((scale * 100).toFixed(2));
+  return Number.isInteger(percentage) ? percentage.toFixed(0) : String(percentage);
+}
+
+function describeVideoPostProcessChanges(
+  rotationApplied: boolean,
+  scale: number,
+  sourceCodec: VideoCodec,
+  outputCodec: VideoCodec
+): string[] {
+  const changes: string[] = [];
+
+  if (rotationApplied) {
+    changes.push("baked the simulator's displayed orientation");
+  }
+
+  if (scale !== 1) {
+    changes.push(`scaled the video to ${formatScalePercentage(scale)}%`);
+  }
+
+  if (outputCodec !== sourceCodec) {
+    changes.push(`encoded the video as ${describeVideoCodec(outputCodec)}`);
+  }
+
+  return changes;
+}
+
+function combineNotes(...notes: Array<string | undefined>): string | undefined {
+  const presentNotes = notes.filter(
+    (note): note is string => typeof note === "string" && note.length > 0
+  );
+
+  return presentNotes.length > 0 ? presentNotes.join("\n") : undefined;
+}
+
+const SWIFT_VIDEO_TRANSCODE_SCRIPT = String.raw`import Foundation
 import AVFoundation
 import CoreGraphics
 
 func usage() -> Never {
-  fputs("usage: rotate-video.swift <input> <output> <angle>\n", stderr)
+  fputs("usage: transcode-video.swift <input> <output> <angle> <scale> <codec>\n", stderr)
   exit(2)
 }
 
-guard CommandLine.arguments.count == 4 else { usage() }
+func scaledDimension(_ value: CGFloat, scale: Double) -> CGFloat {
+  let scaledValue = value * scale
+  return max(2, floor(scaledValue / 2) * 2)
+}
+
+guard CommandLine.arguments.count == 6 else { usage() }
 let inputURL = URL(fileURLWithPath: CommandLine.arguments[1])
 let outputURL = URL(fileURLWithPath: CommandLine.arguments[2])
 guard let angle = Int(CommandLine.arguments[3]) else { usage() }
+guard let scale = Double(CommandLine.arguments[4]), scale.isFinite, scale > 0 else { usage() }
+let codec = CommandLine.arguments[5]
 
 let asset = AVURLAsset(url: inputURL)
 let composition = AVMutableComposition()
 
 guard let videoTrack = asset.tracks(withMediaType: .video).first else {
-  throw NSError(domain: "RotateVideo", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing video track"])
+  throw NSError(domain: "TranscodeVideo", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing video track"])
 }
 
 guard let compositionVideoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
-  throw NSError(domain: "RotateVideo", code: 2, userInfo: [NSLocalizedDescriptionKey: "Could not create video track"])
+  throw NSError(domain: "TranscodeVideo", code: 2, userInfo: [NSLocalizedDescriptionKey: "Could not create video track"])
 }
 
 let duration = asset.duration
@@ -1108,22 +1192,58 @@ let instruction = AVMutableVideoCompositionInstruction()
 instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
 let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
 
-let transform: CGAffineTransform
+let baseRenderSize: CGSize
+let baseTransform: CGAffineTransform
 switch angle {
 case 90:
-  videoComposition.renderSize = CGSize(width: naturalSize.height, height: naturalSize.width)
-  transform = CGAffineTransform(translationX: naturalSize.height, y: 0).rotated(by: .pi / 2)
+  baseRenderSize = CGSize(width: naturalSize.height, height: naturalSize.width)
+  baseTransform = CGAffineTransform(translationX: naturalSize.height, y: 0).rotated(by: .pi / 2)
 case -90:
-  videoComposition.renderSize = CGSize(width: naturalSize.height, height: naturalSize.width)
-  transform = CGAffineTransform(translationX: 0, y: naturalSize.width).rotated(by: -.pi / 2)
+  baseRenderSize = CGSize(width: naturalSize.height, height: naturalSize.width)
+  baseTransform = CGAffineTransform(translationX: 0, y: naturalSize.width).rotated(by: -.pi / 2)
 case 180:
-  videoComposition.renderSize = CGSize(width: naturalSize.width, height: naturalSize.height)
-  transform = CGAffineTransform(translationX: naturalSize.width, y: naturalSize.height).rotated(by: .pi)
+  baseRenderSize = CGSize(width: naturalSize.width, height: naturalSize.height)
+  baseTransform = CGAffineTransform(translationX: naturalSize.width, y: naturalSize.height).rotated(by: .pi)
 case 0:
-  videoComposition.renderSize = naturalSize
-  transform = .identity
+  baseRenderSize = naturalSize
+  baseTransform = .identity
 default:
-  throw NSError(domain: "RotateVideo", code: 3, userInfo: [NSLocalizedDescriptionKey: "Unsupported angle \(angle)"])
+  throw NSError(domain: "TranscodeVideo", code: 3, userInfo: [NSLocalizedDescriptionKey: "Unsupported angle \(angle)"])
+}
+
+let scaledRenderSize = CGSize(
+  width: scaledDimension(baseRenderSize.width, scale: scale),
+  height: scaledDimension(baseRenderSize.height, scale: scale)
+)
+videoComposition.renderSize = scaledRenderSize
+
+let scaleTransform = CGAffineTransform(
+  scaleX: scaledRenderSize.width / baseRenderSize.width,
+  y: scaledRenderSize.height / baseRenderSize.height
+)
+let transform = baseTransform.concatenating(scaleTransform)
+
+let requestedPresetName: String
+switch codec {
+case "hevc":
+  requestedPresetName = AVAssetExportPresetHEVCHighestQuality
+case "h264":
+  requestedPresetName = AVAssetExportPresetHighestQuality
+default:
+  usage()
+}
+
+let actualCodec = codec
+let presetName = requestedPresetName
+var codecFallbackNote: String?
+
+if codec == "hevc" {
+  let compatiblePresets = AVAssetExportSession.exportPresets(compatibleWith: composition)
+  if !compatiblePresets.contains(AVAssetExportPresetHEVCHighestQuality) {
+    actualCodec = "h264"
+    presetName = AVAssetExportPresetHighestQuality
+    codecFallbackNote = "HEVC export is not supported on this Mac, so the built-in macOS video exporter fell back to H.264."
+  }
 }
 
 layerInstruction.setTransform(transform, at: .zero)
@@ -1134,8 +1254,8 @@ if FileManager.default.fileExists(atPath: outputURL.path) {
   try FileManager.default.removeItem(at: outputURL)
 }
 
-guard let exportSession = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
-  throw NSError(domain: "RotateVideo", code: 4, userInfo: [NSLocalizedDescriptionKey: "Could not create export session"])
+guard let exportSession = AVAssetExportSession(asset: composition, presetName: presetName) else {
+  throw NSError(domain: "TranscodeVideo", code: 4, userInfo: [NSLocalizedDescriptionKey: "Could not create export session"])
 }
 exportSession.outputURL = outputURL
 exportSession.outputFileType = .mp4
@@ -1154,32 +1274,43 @@ if let exportError {
   throw exportError
 }
 if exportSession.status != .completed {
-  throw NSError(domain: "RotateVideo", code: 5, userInfo: [NSLocalizedDescriptionKey: "Export failed with status \(exportSession.status.rawValue)"])
+  throw NSError(domain: "TranscodeVideo", code: 5, userInfo: [NSLocalizedDescriptionKey: "Export failed with status \(exportSession.status.rawValue)"])
 }
+
+let result: [String: String] = {
+  var value = ["outputCodec": actualCodec]
+  if let codecFallbackNote {
+    value["note"] = codecFallbackNote
+  }
+  return value
+}()
+let jsonData = try JSONSerialization.data(withJSONObject: result, options: [])
+guard let json = String(data: jsonData, encoding: .utf8) else {
+  throw NSError(domain: "TranscodeVideo", code: 6, userInfo: [NSLocalizedDescriptionKey: "Could not encode export result"])
+}
+print(json)
 `;
 
-async function getSwiftVideoRotationScriptPath(): Promise<string> {
-  if (swiftVideoRotationScriptPath) {
-    return swiftVideoRotationScriptPath;
+async function getSwiftVideoTranscodeScriptPath(): Promise<string> {
+  if (swiftVideoTranscodeScriptPath) {
+    return swiftVideoTranscodeScriptPath;
   }
 
-  const scriptPath = createTempFilePath("rotate-video", "swift");
-  await fs.promises.writeFile(scriptPath, SWIFT_VIDEO_ROTATION_SCRIPT, "utf8");
-  swiftVideoRotationScriptPath = scriptPath;
+  const scriptPath = createTempFilePath("transcode-video", "swift");
+  await fs.promises.writeFile(scriptPath, SWIFT_VIDEO_TRANSCODE_SCRIPT, "utf8");
+  swiftVideoTranscodeScriptPath = scriptPath;
 
   return scriptPath;
 }
 
-async function bakeVideoRotationWithFfmpeg(
+async function transcodeRecordedVideoWithFfmpeg(
   inputPath: string,
   outputPath: string,
-  rotationAngle: RotationAngle
+  rotationAngle: RotationAngle,
+  scale: number,
+  outputCodec: VideoCodec
 ): Promise<void> {
-  const filter = getFfmpegRotationFilter(rotationAngle);
-  if (!filter) {
-    await fs.promises.copyFile(inputPath, outputPath);
-    return;
-  }
+  const filter = getFfmpegVideoFilter(rotationAngle, scale);
 
   await run("ffmpeg", [
     "-y",
@@ -1188,14 +1319,12 @@ async function bakeVideoRotationWithFfmpeg(
     "error",
     "-i",
     inputPath,
-    "-vf",
-    filter,
-    "-c:v",
-    "libx264",
+    ...(filter ? ["-vf", filter] : []),
+    ...getFfmpegVideoCodecArgs(outputCodec),
     "-preset",
     "ultrafast",
-    "-crf",
-    "18",
+    "-pix_fmt",
+    "yuv420p",
     "-c:a",
     "copy",
     "-movflags",
@@ -1204,19 +1333,29 @@ async function bakeVideoRotationWithFfmpeg(
   ]);
 }
 
-async function bakeVideoRotationWithSwift(
+async function transcodeRecordedVideoWithSwift(
   inputPath: string,
   outputPath: string,
-  rotationAngle: RotationAngle
-): Promise<void> {
-  const scriptPath = await getSwiftVideoRotationScriptPath();
-  await run("xcrun", [
+  rotationAngle: RotationAngle,
+  scale: number,
+  outputCodec: VideoCodec
+): Promise<{ outputCodec: VideoCodec; note?: string }> {
+  const scriptPath = await getSwiftVideoTranscodeScriptPath();
+  const { stdout } = await run("xcrun", [
     "swift",
     scriptPath,
     inputPath,
     outputPath,
     String(rotationAngle),
+    String(scale),
+    outputCodec,
   ]);
+
+  if (!stdout) {
+    return { outputCodec };
+  }
+
+  return JSON.parse(stdout) as { outputCodec: VideoCodec; note?: string };
 }
 
 async function replaceFileWithTempOutput(
@@ -1253,38 +1392,61 @@ async function getRecordingStartRotationAngle(
   }
 }
 
-async function bakeRecordedVideoRotation(
+async function postProcessRecordedVideo(
   outputFile: string,
-  startRotationAngle: RotationAngle | null
-): Promise<VideoRotationResult> {
-  if (startRotationAngle === null) {
+  startRotationAngle: RotationAngle | null,
+  options: {
+    fixRotation: boolean;
+    outputCodec: VideoCodec;
+    scale: number;
+    sourceCodec: VideoCodec;
+  }
+): Promise<VideoPostProcessResult> {
+  const rotationNote =
+    options.fixRotation && startRotationAngle === null
+      ? "Rotation fix was skipped because the simulator orientation could not be determined when recording started."
+      : undefined;
+  const rotationAngle =
+    options.fixRotation && startRotationAngle !== null ? startRotationAngle : 0;
+  const getChanges = (actualOutputCodec: VideoCodec) =>
+    describeVideoPostProcessChanges(
+      rotationAngle !== 0,
+      options.scale,
+      options.sourceCodec,
+      actualOutputCodec
+    );
+  const requestedChanges = getChanges(options.outputCodec);
+
+  if (requestedChanges.length === 0) {
     return {
       applied: false,
-      note:
-        "Rotation fix was skipped because the simulator orientation could not be determined when recording started.",
+      changes: requestedChanges,
+      outputCodec: options.outputCodec,
+      note: rotationNote,
     };
   }
 
-  if (startRotationAngle === 0) {
-    return { applied: false };
-  }
-
-  const tempOutputPath = createSiblingTempFilePath(outputFile, "rotated");
+  const tempOutputPath = createSiblingTempFilePath(outputFile, "processed");
   const ffmpegInstalled = await commandExists("ffmpeg");
   let ffmpegFailure: string | null = null;
 
   if (ffmpegInstalled) {
     try {
-      await bakeVideoRotationWithFfmpeg(
+      await transcodeRecordedVideoWithFfmpeg(
         outputFile,
         tempOutputPath,
-        startRotationAngle
+        rotationAngle,
+        options.scale,
+        options.outputCodec
       );
       await replaceFileWithTempOutput(tempOutputPath, outputFile);
 
       return {
         applied: true,
+        changes: requestedChanges,
+        outputCodec: options.outputCodec,
         method: "ffmpeg",
+        note: rotationNote,
       };
     } catch (error) {
       ffmpegFailure = summarizeErrorMessage(describeCommandError(error));
@@ -1293,19 +1455,28 @@ async function bakeRecordedVideoRotation(
   }
 
   try {
-    await bakeVideoRotationWithSwift(
+    const swiftResult = await transcodeRecordedVideoWithSwift(
       outputFile,
       tempOutputPath,
-      startRotationAngle
+      rotationAngle,
+      options.scale,
+      options.outputCodec
     );
     await replaceFileWithTempOutput(tempOutputPath, outputFile);
+    const actualChanges = getChanges(swiftResult.outputCodec);
 
     return {
       applied: true,
+      changes: actualChanges,
+      outputCodec: swiftResult.outputCodec,
       method: "swift",
-      note: ffmpegInstalled
-        ? `Fell back to the built-in macOS video exporter after ffmpeg rotation failed: ${ffmpegFailure}.`
-        : "Install ffmpeg to speed up baked video rotation on future recordings.",
+      note: combineNotes(
+        rotationNote,
+        swiftResult.note,
+        ffmpegInstalled
+          ? `Fell back to the built-in macOS video exporter after ffmpeg video post-processing failed: ${ffmpegFailure}.`
+          : "Install ffmpeg to speed up video post-processing on future recordings."
+      ),
     };
   } catch (error) {
     await fs.promises.unlink(tempOutputPath).catch(() => {});
@@ -1313,12 +1484,12 @@ async function bakeRecordedVideoRotation(
 
     if (ffmpegInstalled && ffmpegFailure) {
       throw new Error(
-        `Failed to bake video rotation with ffmpeg (${ffmpegFailure}) and with the built-in macOS fallback (${swiftFailure})`
+        `Failed to apply video post-processing with ffmpeg (${ffmpegFailure}) and with the built-in macOS fallback (${swiftFailure})`
       );
     }
 
     throw new Error(
-      `Failed to bake video rotation with the built-in macOS fallback: ${swiftFailure}`
+      `Failed to apply video post-processing with the built-in macOS fallback: ${swiftFailure}`
     );
   }
 }
@@ -2949,7 +3120,7 @@ if (!isToolFiltered("record_video")) {
           `Optional output path. If not provided, a default name will be used. The file will be saved in the directory specified by \`IOS_SIMULATOR_MCP_DEFAULT_OUTPUT_DIR\` or in \`~/Downloads\` if the environment variable is not set.`
         ),
       codec: z
-        .enum(["h264", "hevc"])
+        .enum(VIDEO_CODEC_VALUES)
         .optional()
         .describe(
           'Specifies the codec type: "h264" or "hevc". Default is "hevc".'
@@ -2978,6 +3149,7 @@ if (!isToolFiltered("record_video")) {
       let actualUdid: string | null = null;
       let recordingProcess: ChildProcessWithoutNullStreams | null = null;
       let outputFile: string | null = null;
+      const selectedCodec = codec ?? DEFAULT_RECORDING_CODEC;
 
       try {
         actualUdid = udid;
@@ -3020,6 +3192,7 @@ if (!isToolFiltered("record_video")) {
           outputFile,
           process: recordingProcess,
           startRotationAngle: await startRotationAnglePromise,
+          codec: selectedCodec,
         });
         recordingStartupReservationsByUdid.delete(actualUdid);
 
@@ -3072,11 +3245,27 @@ if (!isToolFiltered("stop_recording")) {
         .describe(
           "Bake the saved video into the simulator's displayed orientation before returning. Defaults to true. Falls back to a slower built-in macOS exporter when ffmpeg is unavailable."
         ),
+      scale: z
+        .number()
+        .positive()
+        .optional()
+        .describe(
+          "Scale factor for the saved video. `0.5` means 50% of the original width and height. Defaults to `0.5`."
+        ),
+      output_codec: z
+        .enum(VIDEO_CODEC_VALUES)
+        .optional()
+        .describe(
+          'Output codec for the saved video: "h264" or "hevc". Defaults to "hevc" (H.265 compression).'
+        ),
     },
     { title: "Stop Recording", readOnlyHint: false, openWorldHint: true },
-    async ({ udid, fix_rotation }) => {
+    async ({ udid, fix_rotation, scale, output_codec }) => {
       let actualUdid: string | null = null;
       let recording: ActiveRecording | null = null;
+      const requestedScale = scale ?? DEFAULT_STOP_RECORDING_SCALE;
+      const requestedOutputCodec =
+        output_codec ?? DEFAULT_STOP_RECORDING_OUTPUT_CODEC;
 
       try {
         actualUdid = udid;
@@ -3104,26 +3293,30 @@ if (!isToolFiltered("stop_recording")) {
 
         let text = `Recording stopped successfully for simulator ${actualUdid}. The video was saved to: ${recording.outputFile}`;
 
-        if (fix_rotation !== false) {
-          try {
-            const rotationResult = await bakeRecordedVideoRotation(
-              recording.outputFile,
-              recording.startRotationAngle
-            );
-
-            if (rotationResult.applied) {
-              text +=
-                rotationResult.method === "ffmpeg"
-                  ? "\nBaked rotation was applied automatically using ffmpeg."
-                  : "\nBaked rotation was applied automatically using the built-in macOS video exporter.";
+        try {
+          const postProcessResult = await postProcessRecordedVideo(
+            recording.outputFile,
+            recording.startRotationAngle,
+            {
+              fixRotation: fix_rotation !== false,
+              outputCodec: requestedOutputCodec,
+              scale: requestedScale,
+              sourceCodec: recording.codec,
             }
+          );
 
-            if (rotationResult.note) {
-              text += `\n${rotationResult.note}`;
-            }
-          } catch (rotationError) {
-            text += `\nRotation fix failed after the recording was saved: ${toError(rotationError).message}`;
+          if (postProcessResult.applied) {
+            text +=
+              postProcessResult.method === "ffmpeg"
+                ? `\nVideo post-processing was applied automatically using ffmpeg: ${postProcessResult.changes.join(", ")}.`
+                : `\nVideo post-processing was applied automatically using the built-in macOS video exporter: ${postProcessResult.changes.join(", ")}.`;
           }
+
+          if (postProcessResult.note) {
+            text += `\n${postProcessResult.note}`;
+          }
+        } catch (postProcessError) {
+          text += `\nVideo post-processing failed after the recording was saved: ${toError(postProcessError).message}`;
         }
 
         return {
