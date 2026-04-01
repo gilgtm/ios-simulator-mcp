@@ -288,6 +288,10 @@ This project has been featured and mentioned in various publications and resourc
   udid: string;
   /** Bake the saved video into the simulator's displayed orientation before returning. Defaults to true. Falls back to a slower built-in macOS exporter when ffmpeg is unavailable. */
   fix_rotation?: boolean;
+  /** Scale factor for the saved video. `0.5` means 50% of the original width and height. Defaults to `0.5`. */
+  scale?: number;
+  /** Output codec for the saved video. Defaults to `hevc` (H.265 compression); the built-in macOS fallback exporter may use H.264 on Macs without HEVC export support. */
+  output_codec?: "h264" | "hevc";
 }
 ```
 
@@ -390,7 +394,7 @@ After a feature implementation, instruct your AI assistant within its MCP client
 - **Stop Recording:**
 
   ```
-  Call `get_booted_sim_ids`, choose the same simulator `udid` used for recording, then use `stop_recording` with that `udid` (it bakes the video into the simulator's displayed orientation by default)
+  Call `get_booted_sim_ids`, choose the same simulator `udid` used for recording, then use `stop_recording` with that `udid` (by default it scales the saved video to 50%, targets HEVC/H.265 output, and bakes the video into the simulator's displayed orientation when needed; the built-in macOS fallback exporter may use H.264 on Macs without HEVC export support)
   ```
 
 - **Install App:**
