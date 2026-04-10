@@ -217,8 +217,9 @@ function errorWithTroubleshooting(message: string): string {
 }
 
 type BootedDevice = {
-  id: string;
+  udid: string;
   name: string;
+  iosVersion: string;
 };
 
 type SimctlDevice = {
@@ -364,13 +365,18 @@ async function getBootedDevices(): Promise<BootedDevice[]> {
   if (stderr) throw new Error(stderr);
 
   const devices = (JSON.parse(stdout) as SimctlListDevicesResponse).devices ?? {};
-  const bootedDevices = Object.values(devices)
-    .flat()
-    .filter(isBootedDevice)
-    .map((device) => ({
-      name: device.name,
-      id: device.udid,
-    }));
+  const bootedDevices = Object.entries(devices).flatMap(
+    ([runtimeIdentifier, runtimeDevices]) => {
+      const iosVersion = parseSimulatorRuntimeIdentifier(runtimeIdentifier)?.version
+        ?? runtimeIdentifier;
+
+      return runtimeDevices.filter(isBootedDevice).map((device) => ({
+        udid: device.udid,
+        name: device.name,
+        iosVersion,
+      }));
+    }
+  );
 
   if (bootedDevices.length === 0) {
     throw Error("No booted simulator found");
@@ -400,8 +406,11 @@ async function getBootedDeviceDetails(
         typeof runtimeDevice.name === "string"
       ) {
         return {
-          id: actualDeviceId,
+          udid: actualDeviceId,
           name: runtimeDevice.name,
+          iosVersion:
+            parseSimulatorRuntimeIdentifier(runtimeIdentifier)?.version ??
+            runtimeIdentifier,
           runtimeIdentifier,
         };
       }
@@ -464,13 +473,27 @@ function normalizeRotationAngle(
   }
 }
 
-function formatSimulatorRuntimeTitle(runtimeIdentifier: string): string {
+function parseSimulatorRuntimeIdentifier(
+  runtimeIdentifier: string
+): { platform: string; version: string } | null {
   const match = runtimeIdentifier.match(/SimRuntime\.([A-Za-z]+)-(.+)$/);
   if (!match) {
+    return null;
+  }
+
+  return {
+    platform: match[1],
+    version: match[2].replace(/-/g, "."),
+  };
+}
+
+function formatSimulatorRuntimeTitle(runtimeIdentifier: string): string {
+  const runtime = parseSimulatorRuntimeIdentifier(runtimeIdentifier);
+  if (!runtime) {
     return runtimeIdentifier;
   }
 
-  return `${match[1]} ${match[2].replace(/-/g, ".")}`;
+  return `${runtime.platform} ${runtime.version}`;
 }
 
 async function getSimulatorDevicePreferences(
@@ -1597,7 +1620,7 @@ async function isPortAvailable(port: number): Promise<boolean> {
 }
 
 function pruneWdaPorts(bootedDevices: BootedDevice[]): void {
-  const bootedDeviceIds = new Set(bootedDevices.map((device) => device.id));
+  const bootedDeviceIds = new Set(bootedDevices.map((device) => device.udid));
 
   for (const deviceId of wdaPortsByDeviceId.keys()) {
     if (!bootedDeviceIds.has(deviceId)) {
@@ -2186,7 +2209,7 @@ async function getWdaPortForSwipe(
 if (!isToolFiltered("get_booted_sim_ids")) {
   server.tool(
     "get_booted_sim_ids",
-    "Get the IDs and names of all currently booted iOS simulators",
+    "Get the UDID, name, and iOS version of all currently booted iOS simulators",
     {
       title: "Get Booted Simulator IDs",
       readOnlyHint: true,
