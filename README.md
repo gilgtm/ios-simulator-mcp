@@ -23,11 +23,11 @@ This project has been featured and mentioned in various publications and resourc
 
 ### `get_booted_sim_ids`
 
-**Description:** Get the IDs and names of all currently booted iOS simulators
+**Description:** Get the UDID, name, and iOS version of all currently booted iOS simulators
 
 **Parameters:** No Parameters
 
-**Returns:** A JSON array of booted simulators, each with `id` and `name`
+**Returns:** A JSON array of booted simulators, each with `udid`, `name`, and `iosVersion`
 
 ### `open_simulator`
 
@@ -339,7 +339,7 @@ This MCP server allows AI assistants integrated with a Model Context Protocol (M
 
 ### How to Use
 
-After a feature implementation, instruct your AI assistant within its MCP client environment to use the available tools. First call `get_booted_sim_ids`, choose the simulator you want to test, and pass that `udid` to every simulator-targeted tool call. For example, in Cursor's agent mode, you could use the prompts below to quickly validate and document UI interactions.
+After a feature implementation, instruct your AI assistant within its MCP client environment to use the available tools. First call `get_booted_sim_ids`, choose the simulator you want to test from the returned `name` and `iosVersion`, and pass that `udid` to every simulator-targeted tool call. For example, in Cursor's agent mode, you could use the prompts below to quickly validate and document UI interactions.
 
 ### Example Prompts
 

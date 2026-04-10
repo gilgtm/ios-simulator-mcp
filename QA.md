@@ -9,7 +9,7 @@ You can run a test case copy and pasting the test case into a chat in an MCP cli
 **Note:** This test case was written using iOS 17.2 and the native Photos app. It may need to be adjusted for other iOS versions or Photos app changes.
 
 1. Have the user open the native Photo app in the iOS simulator.
-2. Call `get_booted_sim_ids` to get the names and UDIDs of the booted simulators, choose the simulator under test, and keep that UDID handy for the recording steps below.
+2. Call `get_booted_sim_ids` to get the UDID, name, and iOS version of the booted simulators, choose the simulator under test, and keep that UDID handy for the recording steps below.
 3. Call `record_video` with the chosen simulator UDID to start recording a screen recording of the test.
 4. Call `ui_describe_all` with the chosen simulator UDID to make sure we are on the All Photos tab.
 5. Call `ui_find_element` with the chosen simulator UDID and `{ "search": ["Search"], "type": "Button" }` to find the Search tab button by its label.
@@ -31,7 +31,7 @@ You can run a test case copy and pasting the test case into a chat in an MCP cli
 **Note:** Run this on an iPad simulator and rotate the Simulator window to landscape before starting.
 
 1. Have the user open the iPad Simulator in landscape and show the Home Screen or Photos app.
-2. Call `get_booted_sim_ids` and pick the landscape simulator under test.
+2. Call `get_booted_sim_ids` and pick the landscape simulator under test by its name and iOS version.
 3. Call `read_screen` with the chosen simulator UDID and verify the returned image is landscape-shaped and matches the presented Simulator orientation.
 4. Call `ui_describe_all` with the chosen simulator UDID and confirm the root `frame` dimensions are landscape-oriented.
 5. Call `ui_find_element` with the chosen simulator UDID to locate a visible element in the current landscape view.
