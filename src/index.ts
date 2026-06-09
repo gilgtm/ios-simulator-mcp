@@ -40,11 +40,51 @@ const WDA_APP_PATH = path.join(
   "Debug-iphonesimulator",
   "WebDriverAgentRunner-Runner.app"
 );
+const WDA_XCTESTRUN_PREFIX = "WebDriverAgentRunner_";
+const WDA_LAUNCH_XCTESTRUN_PREFIX = "WebDriverAgentRunnerLaunch-";
+const WDA_XCTESTRUN_SUFFIX = ".xctestrun";
+const WDA_TEST_IDENTIFIER = "WebDriverAgentRunner/UITestingUITests/testRunner";
 const WDA_BUILD_TIMEOUT_MS = 120_000;
 const WDA_BUILD_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
-const WDA_START_TIMEOUT_MS = 10_000;
+const WDA_START_TIMEOUT_MS = 30_000;
+const WDA_STOP_TIMEOUT_MS = 5_000;
+const WDA_TERMINATE_TIMEOUT_MS = 2_000;
 const WDA_STATUS_POLL_INTERVAL_MS = 100;
+const WDA_STATUS_FETCH_TIMEOUT_MS = 1_000;
 const WDA_PORT_SEARCH_LIMIT = 100;
+const WDA_MJPEG_PORT_OFFSET = 1000;
+const MIN_WDA_PORT = 1024;
+const MAX_TCP_PORT = 65535;
+const MAX_WDA_PORT = MAX_TCP_PORT - WDA_MJPEG_PORT_OFFSET;
+const WDA_LAUNCH_XCTESTRUN_STALE_MS = 60 * 60 * 1000;
+const WDA_LOG_MAX_BYTES = 1024 * 1024;
+const WDA_XCTESTRUN_ENV_PATHS = [
+  "WebDriverAgentRunner.EnvironmentVariables",
+  "WebDriverAgentRunner.TestingEnvironmentVariables",
+] as const;
+const XCODEBUILD_ENV_ALLOWLIST = [
+  "ALL_PROXY",
+  "DEVELOPER_DIR",
+  "HOME",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "NO_PROXY",
+  "PATH",
+  "SDKROOT",
+  "TEMP",
+  "TERM",
+  "TMP",
+  "TMPDIR",
+  "TOOLCHAINS",
+  "XCODE_XCCONFIG_FILE",
+  "all_proxy",
+  "https_proxy",
+  "http_proxy",
+  "no_proxy",
+] as const;
 const VIDEO_CODEC_VALUES = ["h264", "hevc"] as const;
 const DEFAULT_RECORDING_CODEC = "hevc";
 const DEFAULT_STOP_RECORDING_SCALE = 0.5;
@@ -53,12 +93,15 @@ const parsedWdaPort = Number.parseInt(
   process.env.IOS_SIMULATOR_MCP_WDA_PORT ?? "",
   10
 );
-const WDA_PORT_START = Number.isFinite(parsedWdaPort) ? parsedWdaPort : 8100;
 const wdaPortsByDeviceId = new Map<string, number>();
+const wdaLaunchLocksByDeviceId = new Map<string, Promise<void>>();
+const wdaProcessesByDeviceId = new Map<string, WdaXcodebuildProcess>();
 const activeRecordingsByUdid = new Map<string, ActiveRecording>();
 const recordingStartupReservationsByUdid = new Set<string>();
 let wdaPortLock = Promise.resolve();
+let wdaSharedDerivedDataLock = Promise.resolve();
 let swiftVideoTranscodeScriptPath: string | null = null;
+let isServerCleaningUp = false;
 const ERROR_SUMMARY_MAX_CHARS = 300;
 const RECORDING_START_TIMEOUT_MS = 3000;
 const RECORDING_STOP_FINALIZATION_TIMEOUT_MS = 3000;
@@ -72,11 +115,12 @@ const RECORDING_STOP_FINALIZATION_TIMEOUT_MS = 3000;
 async function run(
   cmd: string,
   args: string[],
-  options?: { env?: NodeJS.ProcessEnv }
+  options?: { env?: NodeJS.ProcessEnv; timeoutMs?: number }
 ): Promise<{ stdout: string; stderr: string }> {
   const { stdout, stderr } = await execFileAsync(cmd, args, {
     shell: false,
     ...(options?.env ? { env: options.env } : {}),
+    ...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
   });
   return {
     stdout: stdout.trim(),
@@ -143,6 +187,36 @@ const server = new McpServer({
   name: "ios-simulator",
   version: require("../package.json").version,
 });
+
+function getWdaPortStart(): number {
+  if (!process.env.IOS_SIMULATOR_MCP_WDA_PORT) {
+    return 8100;
+  }
+
+  if (
+    !/^\d+$/.test(process.env.IOS_SIMULATOR_MCP_WDA_PORT) ||
+    !Number.isInteger(parsedWdaPort) ||
+    parsedWdaPort < MIN_WDA_PORT ||
+    parsedWdaPort > MAX_WDA_PORT
+  ) {
+    throw new Error(
+      `IOS_SIMULATOR_MCP_WDA_PORT must be an integer from ${MIN_WDA_PORT} through ${MAX_WDA_PORT} so WebDriverAgent can bind as the current user and its MJPEG port also stays within ${MAX_TCP_PORT}`
+    );
+  }
+
+  return parsedWdaPort;
+}
+
+function getWdaMjpegPort(port: number): number {
+  const mjpegPort = port + WDA_MJPEG_PORT_OFFSET;
+  if (mjpegPort > MAX_TCP_PORT) {
+    throw new Error(
+      `WebDriverAgent port ${port} leaves no valid MJPEG port; choose a port at or below ${MAX_WDA_PORT}`
+    );
+  }
+
+  return mjpegPort;
+}
 
 function toError(input: unknown): Error {
   if (input instanceof Error) return input;
@@ -312,6 +386,20 @@ type WdaLaunchResult =
       reason: string;
     };
 
+type WdaXcodebuildProcess = {
+  closed: boolean;
+  logPath: string;
+  port: number;
+  process: ChildProcessWithoutNullStreams;
+  resultBundlePath: string;
+  xctestrunPath: string;
+};
+
+type BoundedLogState = {
+  bytesWritten: number;
+  truncated: boolean;
+};
+
 type WdaPortForSwipeResult =
   | {
       port: number;
@@ -388,7 +476,7 @@ async function getBootedDevices(): Promise<BootedDevice[]> {
 async function getBootedDeviceDetails(
   deviceId: string
 ): Promise<BootedDeviceDetails> {
-  const actualDeviceId = deviceId;
+  const normalizedDeviceId = deviceId.toUpperCase();
   const { stdout, stderr } = await run("xcrun", [
     "simctl",
     "list",
@@ -402,11 +490,11 @@ async function getBootedDeviceDetails(
   for (const [runtimeIdentifier, runtimeDevices] of Object.entries(devices)) {
     for (const runtimeDevice of runtimeDevices) {
       if (
-        runtimeDevice.udid === actualDeviceId &&
+        runtimeDevice.udid?.toUpperCase() === normalizedDeviceId &&
         typeof runtimeDevice.name === "string"
       ) {
         return {
-          udid: actualDeviceId,
+          udid: runtimeDevice.udid ?? normalizedDeviceId,
           name: runtimeDevice.name,
           iosVersion:
             parseSimulatorRuntimeIdentifier(runtimeIdentifier)?.version ??
@@ -417,7 +505,7 @@ async function getBootedDeviceDetails(
     }
   }
 
-  throw new Error(`Could not find simulator details for device ${actualDeviceId}`);
+  throw new Error(`Could not find simulator details for device ${deviceId}`);
 }
 
 function isUiPoint(value: unknown): value is UiPoint {
@@ -1606,6 +1694,25 @@ async function withWdaPortLock<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+async function withWdaSharedDerivedDataLock<T>(
+  fn: () => Promise<T>
+): Promise<T> {
+  let releaseLock = () => {};
+  const nextLock = new Promise<void>((resolve) => {
+    releaseLock = resolve;
+  });
+  const previousLock = wdaSharedDerivedDataLock;
+  wdaSharedDerivedDataLock = previousLock.then(() => nextLock);
+
+  await previousLock;
+
+  try {
+    return await fn();
+  } finally {
+    releaseLock();
+  }
+}
+
 async function getListeningPidsForPort(port: number): Promise<string[]> {
   try {
     const { stdout } = await run("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
@@ -1619,6 +1726,15 @@ async function isPortAvailable(port: number): Promise<boolean> {
   return (await getListeningPidsForPort(port)).length === 0;
 }
 
+async function isWdaPortPairAvailable(port: number): Promise<boolean> {
+  const mjpegPort = getWdaMjpegPort(port);
+  const [isHttpPortAvailable, isMjpegPortAvailable] = await Promise.all([
+    isPortAvailable(port),
+    isPortAvailable(mjpegPort),
+  ]);
+  return isHttpPortAvailable && isMjpegPortAvailable;
+}
+
 function pruneWdaPorts(bootedDevices: BootedDevice[]): void {
   const bootedDeviceIds = new Set(bootedDevices.map((device) => device.udid));
 
@@ -1630,14 +1746,23 @@ function pruneWdaPorts(bootedDevices: BootedDevice[]): void {
 }
 
 async function isWdaRunning(port: number): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    WDA_STATUS_FETCH_TIMEOUT_MS
+  );
   try {
-    const response = await fetch(`${getWdaBaseUrl(port)}/status`);
+    const response = await fetch(`${getWdaBaseUrl(port)}/status`, {
+      signal: controller.signal,
+    });
     if (!response.ok) return false;
 
     const payload = (await response.json()) as WdaStatusResponse;
     return payload.value?.ready === true;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -1906,13 +2031,14 @@ async function restoreAppAfterWdaLaunch(
 
 async function getOrAllocateWdaPort(deviceId: string): Promise<number> {
   return withWdaPortLock(async () => {
+    const wdaPortStart = getWdaPortStart();
     const bootedDevices = await getBootedDevices();
     pruneWdaPorts(bootedDevices);
     const normalizedDeviceId = deviceId.toUpperCase();
 
-    const existingPort = wdaPortsByDeviceId.get(deviceId);
+    const existingPort = wdaPortsByDeviceId.get(normalizedDeviceId);
     if (existingPort !== undefined) {
-      if (await isPortAvailable(existingPort)) {
+      if (await isWdaPortPairAvailable(existingPort)) {
         return existingPort;
       }
 
@@ -1925,24 +2051,38 @@ async function getOrAllocateWdaPort(deviceId: string): Promise<number> {
         }
       }
 
-      wdaPortsByDeviceId.delete(deviceId);
+      wdaPortsByDeviceId.delete(normalizedDeviceId);
     }
 
     const reservedPorts = new Set(wdaPortsByDeviceId.values());
     for (let offset = 0; offset < WDA_PORT_SEARCH_LIMIT; offset += 1) {
-      const port = WDA_PORT_START + offset;
+      const port = wdaPortStart + offset;
+      if (port > MAX_WDA_PORT) {
+        break;
+      }
+
       if (reservedPorts.has(port)) {
         continue;
       }
 
-      if (await isPortAvailable(port)) {
-        wdaPortsByDeviceId.set(deviceId, port);
+      if (await isWdaPortPairAvailable(port)) {
+        wdaPortsByDeviceId.set(normalizedDeviceId, port);
         return port;
+      }
+
+      if (await isWdaRunning(port)) {
+        try {
+          await getVerifiedWdaDeviceIdForPort(port, normalizedDeviceId);
+          wdaPortsByDeviceId.set(normalizedDeviceId, port);
+          return port;
+        } catch {
+          // Keep searching; this listener does not belong to the requested simulator.
+        }
       }
     }
 
     throw new Error(
-      `Could not find an available WebDriverAgent port starting at ${WDA_PORT_START}`
+      `Could not find available WebDriverAgent HTTP and MJPEG ports starting at ${wdaPortStart}`
     );
   });
 }
@@ -1952,9 +2092,124 @@ async function getXcodeVersion(): Promise<string> {
   return stdout.replace(/\s+/g, "-");
 }
 
-async function isWdaBuildCached(): Promise<boolean> {
+async function pathExists(filePath: string): Promise<boolean> {
+  return fs.promises
+    .access(filePath)
+    .then(() => true)
+    .catch(() => false);
+}
+
+function getWdaProductsDir(): string {
+  return path.join(WDA_DERIVED_DATA_DIR, "Build", "Products");
+}
+
+function getSimulatorArchitectureName(): string {
+  return process.arch === "x64" ? "x86_64" : process.arch;
+}
+
+async function getIphoneSimulatorSdkVersion(): Promise<string> {
+  const { stdout } = await run("xcrun", [
+    "--sdk",
+    "iphonesimulator",
+    "--show-sdk-version",
+  ]);
+  return stdout;
+}
+
+async function getNewestExistingPath(paths: string[]): Promise<string> {
+  const pathsWithStats = await Promise.all(
+    paths.map(async (candidatePath) => ({
+      path: candidatePath,
+      mtimeMs: await fs.promises
+        .stat(candidatePath)
+        .then((stat) => stat.mtimeMs)
+        .catch(() => null),
+    }))
+  );
+
+  const existingPaths = pathsWithStats.filter(
+    (candidate): candidate is { path: string; mtimeMs: number } =>
+      candidate.mtimeMs !== null
+  );
+  if (existingPaths.length === 0) {
+    throw new Error("No existing paths found");
+  }
+
+  return existingPaths.sort((left, right) => right.mtimeMs - left.mtimeMs)[0].path;
+}
+
+async function getWdaXctestrunPath(deviceId: string): Promise<string> {
+  const productsDir = getWdaProductsDir();
+  const deviceDetails = await getBootedDeviceDetails(deviceId);
+  const simulatorSdkVersion = await getIphoneSimulatorSdkVersion().catch(
+    () => deviceDetails.iosVersion
+  );
+  const architectureSuffix = `-${getSimulatorArchitectureName()}${WDA_XCTESTRUN_SUFFIX}`;
+  const expectedFileName =
+    `${WDA_XCTESTRUN_PREFIX}iphonesimulator${simulatorSdkVersion}${architectureSuffix}`;
+  const expectedPath = path.join(productsDir, expectedFileName);
+
+  if (await pathExists(expectedPath)) {
+    return expectedPath;
+  }
+
+  const sdkPrefix = `${WDA_XCTESTRUN_PREFIX}iphonesimulator${simulatorSdkVersion}-`;
+  const runtimePrefix =
+    `${WDA_XCTESTRUN_PREFIX}iphonesimulator${deviceDetails.iosVersion}-`;
+  const xctestrunEntries = await fs.promises
+    .readdir(productsDir)
+    .then((entries) => entries.filter(
+      (entry) =>
+        entry.startsWith(`${WDA_XCTESTRUN_PREFIX}iphonesimulator`) &&
+        entry.endsWith(WDA_XCTESTRUN_SUFFIX)
+    ))
+    .catch(() => []);
+  const sdkCandidatePaths = xctestrunEntries
+    .filter((entry) => entry.startsWith(sdkPrefix))
+    .map((entry) => path.join(productsDir, entry));
+
+  if (sdkCandidatePaths.length > 0) {
+    return getNewestExistingPath(sdkCandidatePaths);
+  }
+
+  const runtimeCandidatePaths = xctestrunEntries
+    .filter((entry) => entry.startsWith(runtimePrefix))
+    .map((entry) => path.join(productsDir, entry));
+
+  if (runtimeCandidatePaths.length > 0) {
+    return getNewestExistingPath(runtimeCandidatePaths);
+  }
+
+  const architectureCandidatePaths = xctestrunEntries
+    .filter((entry) => entry.endsWith(architectureSuffix))
+    .map((entry) => path.join(productsDir, entry));
+
+  if (architectureCandidatePaths.length > 0) {
+    return getNewestExistingPath(architectureCandidatePaths);
+  }
+
+  const candidatePaths = xctestrunEntries.map((entry) =>
+    path.join(productsDir, entry)
+  );
+  if (candidatePaths.length > 0) {
+    return getNewestExistingPath(candidatePaths);
+  }
+
+  const deviceDescription =
+    `${deviceDetails.name}, iOS ${deviceDetails.iosVersion}, ` +
+    `iphonesimulator SDK ${simulatorSdkVersion}`;
+  throw new Error(
+    `WebDriverAgent xctestrun file not found for simulator ${deviceId} (${deviceDescription}) in ${productsDir}`
+  );
+}
+
+async function isWdaBuildCached(deviceId: string): Promise<boolean> {
   try {
     await fs.promises.access(WDA_APP_PATH);
+    const xctestrunPath = await getWdaXctestrunPath(deviceId);
+    if (!(await hasSupportedWdaXctestrunEnvironmentPath(xctestrunPath))) {
+      return false;
+    }
     const versionFile = path.join(WDA_CACHE_DIR, "xcode-version");
     const cachedVersion = await fs.promises
       .readFile(versionFile, "utf-8")
@@ -2014,6 +2269,7 @@ async function buildWda(deviceId: string): Promise<void> {
       ],
       {
         shell: false,
+        env: getXcodebuildEnv(),
         timeout: WDA_BUILD_TIMEOUT_MS,
         maxBuffer: WDA_BUILD_MAX_BUFFER_BYTES,
       }
@@ -2026,13 +2282,20 @@ async function buildWda(deviceId: string): Promise<void> {
   }
 
   if (
-    !(await fs.promises
-      .access(WDA_APP_PATH)
-      .then(() => true)
-      .catch(() => false))
+    !(await pathExists(WDA_APP_PATH))
   ) {
     throw new Error(
       `xcodebuild succeeded but WDA app not found at ${WDA_APP_PATH}. stderr: ${stderr}`
+    );
+  }
+
+  try {
+    await getWdaXctestrunPath(deviceId);
+  } catch (error) {
+    throw new Error(
+      `xcodebuild succeeded but WDA xctestrun file was not found. ${describeCommandError(
+        error
+      )}. stderr: ${stderr}`
     );
   }
 
@@ -2041,6 +2304,12 @@ async function buildWda(deviceId: string): Promise<void> {
     path.join(WDA_CACHE_DIR, "xcode-version"),
     currentVersion
   );
+}
+
+function throwIfServerCleaningUp(action: string): void {
+  if (isServerCleaningUp) {
+    throw new Error(`Cannot ${action}; the MCP server is shutting down`);
+  }
 }
 
 async function installWdaOnSimulator(deviceId: string): Promise<void> {
@@ -2056,67 +2325,606 @@ async function installWdaOnSimulator(deviceId: string): Promise<void> {
 }
 
 async function ensureWdaInstalled(deviceId: string): Promise<void> {
-  if (!(await isWdaBuildCached())) {
-    try {
-      await cloneWdaRepo();
-    } catch (error) {
-      throw new Error(
-        `Failed to fetch WebDriverAgent sources: ${describeCommandError(error)}`
-      );
-    }
+  throwIfServerCleaningUp("install WebDriverAgent");
 
-    await buildWda(deviceId);
+  if (!(await isWdaBuildCached(deviceId))) {
+    await withWdaSharedDerivedDataLock(async () => {
+      throwIfServerCleaningUp("build WebDriverAgent");
+
+      if (await isWdaBuildCached(deviceId)) {
+        return;
+      }
+
+      try {
+        await cloneWdaRepo();
+      } catch (error) {
+        throw new Error(
+          `Failed to fetch WebDriverAgent sources: ${describeCommandError(error)}`
+        );
+      }
+
+      throwIfServerCleaningUp("build WebDriverAgent");
+      await buildWda(deviceId);
+      throwIfServerCleaningUp("install WebDriverAgent");
+    });
   }
 
+  throwIfServerCleaningUp("install WebDriverAgent");
   await installWdaOnSimulator(deviceId);
+}
+
+async function withWdaLaunchLock<T>(
+  deviceId: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  let releaseLock = () => {};
+  const nextLock = new Promise<void>((resolve) => {
+    releaseLock = resolve;
+  });
+  const previousLock = wdaLaunchLocksByDeviceId.get(deviceId) ?? Promise.resolve();
+  const chainedLock = previousLock.then(() => nextLock);
+  wdaLaunchLocksByDeviceId.set(deviceId, chainedLock);
+
+  await previousLock;
+
+  try {
+    return await fn();
+  } finally {
+    releaseLock();
+    if (wdaLaunchLocksByDeviceId.get(deviceId) === chainedLock) {
+      wdaLaunchLocksByDeviceId.delete(deviceId);
+    }
+  }
+}
+
+function getXcodebuildEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of XCODEBUILD_ENV_ALLOWLIST) {
+    const value = process.env[key];
+    if (value) {
+      env[key] = value;
+    }
+  }
+
+  env.PATH ??= "/usr/bin:/bin:/usr/sbin:/sbin";
+  return env;
+}
+
+async function setPlistString(
+  plistPath: string,
+  keyPath: string,
+  value: string
+): Promise<void> {
+  try {
+    await run("plutil", ["-replace", keyPath, "-string", value, plistPath]);
+  } catch {
+    await run("plutil", ["-insert", keyPath, "-string", value, plistPath]);
+  }
+}
+
+async function plistKeyExists(
+  plistPath: string,
+  keyPath: string
+): Promise<boolean> {
+  try {
+    await run("plutil", ["-extract", keyPath, "xml1", "-o", "-", plistPath]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function hasSupportedWdaXctestrunEnvironmentPath(
+  xctestrunPath: string
+): Promise<boolean> {
+  for (const envPath of WDA_XCTESTRUN_ENV_PATHS) {
+    if (await plistKeyExists(xctestrunPath, envPath)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function setWdaXctestrunEnvironmentValue(
+  xctestrunPath: string,
+  key: string,
+  value: string
+): Promise<void> {
+  let didSetValue = false;
+  let lastError: unknown = null;
+
+  for (const envPath of WDA_XCTESTRUN_ENV_PATHS) {
+    try {
+      if (!(await plistKeyExists(xctestrunPath, envPath))) {
+        continue;
+      }
+      await setPlistString(xctestrunPath, `${envPath}.${key}`, value);
+      didSetValue = true;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (!didSetValue) {
+    const errorDetail =
+      lastError === null
+        ? `no supported xctestrun environment path found; expected one of ${WDA_XCTESTRUN_ENV_PATHS.join(
+            ", "
+          )}`
+        : describeCommandError(lastError);
+    throw new Error(
+      `Could not set ${key} in WDA xctestrun environment: ${errorDetail}`
+    );
+  }
+}
+
+async function createWdaLaunchXctestrun(
+  sourceXctestrunPath: string,
+  port: number
+): Promise<string> {
+  const uniqueSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const launchXctestrunPath = path.join(
+    path.dirname(sourceXctestrunPath),
+    `${WDA_LAUNCH_XCTESTRUN_PREFIX}${port}-${uniqueSuffix}${WDA_XCTESTRUN_SUFFIX}`
+  );
+
+  await fs.promises.copyFile(sourceXctestrunPath, launchXctestrunPath);
+  try {
+    await setWdaXctestrunEnvironmentValue(
+      launchXctestrunPath,
+      "USE_PORT",
+      String(port)
+    );
+    await setWdaXctestrunEnvironmentValue(
+      launchXctestrunPath,
+      "MJPEG_SERVER_PORT",
+      String(getWdaMjpegPort(port))
+    );
+  } catch (error) {
+    await fs.promises.unlink(launchXctestrunPath).catch(() => {});
+    throw error;
+  }
+
+  return launchXctestrunPath;
+}
+
+async function pruneWdaLaunchXctestrunFiles(): Promise<void> {
+  const productsDir = getWdaProductsDir();
+  const entries = await fs.promises.readdir(productsDir).catch(() => []);
+  const trackedXctestrunPaths = new Set(
+    Array.from(wdaProcessesByDeviceId.values()).map(
+      (trackedProcess) => trackedProcess.xctestrunPath
+    )
+  );
+  const cutoffMs = Date.now() - WDA_LAUNCH_XCTESTRUN_STALE_MS;
+  await Promise.all(
+    entries
+      .filter(
+        (entry) =>
+          entry.startsWith(WDA_LAUNCH_XCTESTRUN_PREFIX) &&
+          entry.endsWith(WDA_XCTESTRUN_SUFFIX)
+      )
+      .map(async (entry) => {
+        const launchXctestrunPath = path.join(productsDir, entry);
+        if (trackedXctestrunPaths.has(launchXctestrunPath)) {
+          return;
+        }
+
+        const stat = await fs.promises
+          .stat(launchXctestrunPath)
+          .catch(() => null);
+        if (!stat || stat.mtimeMs > cutoffMs) {
+          return;
+        }
+
+        await fs.promises.unlink(launchXctestrunPath).catch(() => {});
+      })
+  );
+}
+
+function endLogStream(logStream: fs.WriteStream): void {
+  if (!logStream.destroyed && !logStream.writableEnded) {
+    logStream.end();
+  }
+}
+
+function writeBoundedLogChunk(
+  logStream: fs.WriteStream,
+  logState: BoundedLogState,
+  chunk: Buffer | string
+): void {
+  if (logStream.destroyed || logStream.writableEnded) {
+    return;
+  }
+
+  const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+  const remainingBytes = WDA_LOG_MAX_BYTES - logState.bytesWritten;
+  if (remainingBytes <= 0) {
+    if (!logState.truncated) {
+      logState.truncated = true;
+      logStream.write(`\nLog truncated after ${WDA_LOG_MAX_BYTES} bytes.\n`);
+    }
+    return;
+  }
+
+  if (buffer.length <= remainingBytes) {
+    logState.bytesWritten += buffer.length;
+    logStream.write(buffer);
+    return;
+  }
+
+  logState.bytesWritten = WDA_LOG_MAX_BYTES;
+  logStream.write(buffer.subarray(0, remainingBytes));
+  if (!logState.truncated) {
+    logState.truncated = true;
+    logStream.write(`\nLog truncated after ${WDA_LOG_MAX_BYTES} bytes.\n`);
+  }
+}
+
+function isWdaXcodebuildProcessRunning(
+  trackedProcess: WdaXcodebuildProcess
+): boolean {
+  return (
+    !trackedProcess.closed &&
+    trackedProcess.process.exitCode === null &&
+    trackedProcess.process.signalCode === null
+  );
+}
+
+function signalWdaXcodebuildProcess(
+  trackedProcess: WdaXcodebuildProcess,
+  signal: NodeJS.Signals
+): void {
+  const pid = trackedProcess.process.pid;
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Fall back to signaling the direct child process.
+    }
+  }
+
+  try {
+    trackedProcess.process.kill(signal);
+  } catch {
+    // Ignore cleanup errors.
+  }
+}
+
+async function waitForWdaXcodebuildProcessExit(
+  trackedProcess: WdaXcodebuildProcess,
+  timeoutMs: number
+): Promise<boolean> {
+  if (!isWdaXcodebuildProcessRunning(trackedProcess)) {
+    return true;
+  }
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(false), timeoutMs);
+    trackedProcess.process.once("close", () => {
+      clearTimeout(timeout);
+      resolve(true);
+    });
+  });
+}
+
+async function terminateWdaOnSimulator(deviceId: string): Promise<void> {
+  await run("xcrun", ["simctl", "terminate", deviceId, WDA_BUNDLE_ID], {
+    timeoutMs: WDA_TERMINATE_TIMEOUT_MS,
+  }).catch(() => {});
+}
+
+async function stopWdaXcodebuildProcess(deviceId: string): Promise<void> {
+  const trackedProcess = wdaProcessesByDeviceId.get(deviceId);
+  if (!trackedProcess) {
+    return;
+  }
+
+  wdaProcessesByDeviceId.delete(deviceId);
+  if (isWdaXcodebuildProcessRunning(trackedProcess)) {
+    signalWdaXcodebuildProcess(trackedProcess, "SIGTERM");
+    await terminateWdaOnSimulator(deviceId);
+
+    if (
+      !(await waitForWdaXcodebuildProcessExit(
+        trackedProcess,
+        WDA_STOP_TIMEOUT_MS
+      ))
+    ) {
+      signalWdaXcodebuildProcess(trackedProcess, "SIGKILL");
+      await waitForWdaXcodebuildProcessExit(trackedProcess, 1_000);
+    }
+  } else {
+    await terminateWdaOnSimulator(deviceId);
+  }
+
+  await fs.promises.unlink(trackedProcess.xctestrunPath).catch(() => {});
+  await fs.promises
+    .rm(trackedProcess.resultBundlePath, { recursive: true, force: true })
+    .catch(() => {});
+}
+
+async function stopWdaAfterSetupFailure(
+  deviceId: string,
+  port: number
+): Promise<void> {
+  removeWdaPortMappings(port);
+  await stopWdaXcodebuildProcess(deviceId);
+  await terminateWdaOnSimulator(deviceId);
+}
+
+async function stopAllWdaXcodebuildProcesses(): Promise<void> {
+  await Promise.all(
+    Array.from(wdaProcessesByDeviceId.keys()).map((deviceId) =>
+      stopWdaXcodebuildProcess(deviceId)
+    )
+  );
+}
+
+function signalAllWdaXcodebuildProcesses(): void {
+  for (const trackedProcess of wdaProcessesByDeviceId.values()) {
+    if (isWdaXcodebuildProcessRunning(trackedProcess)) {
+      signalWdaXcodebuildProcess(trackedProcess, "SIGTERM");
+    }
+    try {
+      fs.unlinkSync(trackedProcess.xctestrunPath);
+    } catch {
+      // Ignore cleanup errors.
+    }
+    try {
+      fs.rmSync(trackedProcess.resultBundlePath, {
+        recursive: true,
+        force: true,
+      });
+    } catch {
+      // Ignore cleanup errors.
+    }
+  }
+  wdaProcessesByDeviceId.clear();
 }
 
 async function launchWda(
   deviceId: string,
   port: number
 ): Promise<WdaLaunchResult> {
+  // xcodebuild can touch the shared DerivedData tree until WDA is ready, so
+  // cold launches are intentionally serialized across simulators.
+  return withWdaSharedDerivedDataLock(() => launchWdaLocked(deviceId, port));
+}
+
+async function launchWdaLocked(
+  deviceId: string,
+  port: number
+): Promise<WdaLaunchResult> {
+  if (isServerCleaningUp) {
+    return {
+      ok: false,
+      reason: "xcodebuild launch skipped because the MCP server is shutting down",
+    };
+  }
+
+  const existingTrackedProcess = wdaProcessesByDeviceId.get(deviceId);
+  if (existingTrackedProcess) {
+    if (
+      existingTrackedProcess.port === port &&
+      isWdaXcodebuildProcessRunning(existingTrackedProcess) &&
+      (await isWdaRunning(port))
+    ) {
+      return { ok: true };
+    }
+
+    await stopWdaXcodebuildProcess(deviceId);
+  }
+
+  let xctestrunPath: string;
   try {
-    await run(
-      "xcrun",
-      [
-        "simctl",
-        "launch",
-        "--terminate-running-process",
-        deviceId,
-        WDA_BUNDLE_ID,
-      ],
-      {
-        env: {
-          ...process.env,
-          SIMCTL_CHILD_USE_PORT: String(port),
-        },
-      }
+    await pruneWdaLaunchXctestrunFiles();
+    xctestrunPath = await createWdaLaunchXctestrun(
+      await getWdaXctestrunPath(deviceId),
+      port
     );
   } catch (error) {
     return {
       ok: false,
-      reason: `simctl launch failed: ${describeCommandError(error)}`,
+      reason: `xcodebuild launch preparation failed: ${describeCommandError(error)}`,
     };
   }
 
+  if (isServerCleaningUp) {
+    await fs.promises.unlink(xctestrunPath).catch(() => {});
+    return {
+      ok: false,
+      reason: "xcodebuild launch skipped because the MCP server is shutting down",
+    };
+  }
+
+  await terminateWdaOnSimulator(deviceId);
+
+  if (isServerCleaningUp) {
+    await fs.promises.unlink(xctestrunPath).catch(() => {});
+    return {
+      ok: false,
+      reason: "xcodebuild launch skipped because the MCP server is shutting down",
+    };
+  }
+
+  const resultBundlePath = createTempFilePath("wda-xcodebuild", "xcresult");
+  const args = [
+    "test-without-building",
+    "-xctestrun",
+    xctestrunPath,
+    "-destination",
+    `platform=iOS Simulator,id=${deviceId}`,
+    "-derivedDataPath",
+    WDA_DERIVED_DATA_DIR,
+    "-resultBundlePath",
+    resultBundlePath,
+    `-only-testing:${WDA_TEST_IDENTIFIER}`,
+  ];
+  let logPath = "";
+  let logStream: fs.WriteStream | null = null;
+  let wdaProcess: ChildProcessWithoutNullStreams | null = null;
+  try {
+    logPath = await writeTempLog(
+      "wda-xcodebuild",
+      `$ xcodebuild ${args.join(" ")}\n`
+    );
+    logStream = fs.createWriteStream(logPath, { flags: "a" });
+    logStream.on("error", () => {
+      // Logging should never crash the MCP server or mask the WDA launch result.
+    });
+    wdaProcess = spawn("xcodebuild", args, {
+      detached: true,
+      env: getXcodebuildEnv(),
+      shell: false,
+    });
+  } catch (error) {
+    await fs.promises.unlink(xctestrunPath).catch(() => {});
+    await fs.promises
+      .rm(resultBundlePath, { recursive: true, force: true })
+      .catch(() => {});
+    if (logStream) {
+      endLogStream(logStream);
+    }
+    const logNote = logPath ? ` Full log written to: ${logPath}` : "";
+    return {
+      ok: false,
+      reason: `xcodebuild launch failed to start: ${describeCommandError(
+        error
+      )}.${logNote}`,
+    };
+  }
+  if (!logStream || !wdaProcess) {
+    await fs.promises.unlink(xctestrunPath).catch(() => {});
+    await fs.promises
+      .rm(resultBundlePath, { recursive: true, force: true })
+      .catch(() => {});
+    return {
+      ok: false,
+      reason: `xcodebuild launch failed to start. Full log written to: ${logPath}`,
+    };
+  }
+
+  let spawnError: Error | null = null;
+  let exitDescription: string | null = null;
+  const logState: BoundedLogState = {
+    bytesWritten: 0,
+    truncated: false,
+  };
+  const trackedProcess: WdaXcodebuildProcess = {
+    closed: false,
+    logPath,
+    port,
+    process: wdaProcess,
+    resultBundlePath,
+    xctestrunPath,
+  };
+
+  wdaProcess.stdout.on("data", (chunk) =>
+    writeBoundedLogChunk(logStream, logState, chunk)
+  );
+  wdaProcess.stderr.on("data", (chunk) =>
+    writeBoundedLogChunk(logStream, logState, chunk)
+  );
+  wdaProcess.once("error", (error) => {
+    spawnError = error;
+    trackedProcess.closed = true;
+    writeBoundedLogChunk(
+      logStream,
+      logState,
+      `\nxcodebuild failed to start: ${describeCommandError(error)}\n`
+    );
+  });
+  wdaProcess.once("close", (code, signal) => {
+    trackedProcess.closed = true;
+    exitDescription =
+      signal !== null ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
+    writeBoundedLogChunk(
+      logStream,
+      logState,
+      `\nxcodebuild exited with ${exitDescription}\n`
+    );
+    logStream.end();
+
+    const currentProcess = wdaProcessesByDeviceId.get(deviceId);
+    if (currentProcess?.process === wdaProcess) {
+      wdaProcessesByDeviceId.delete(deviceId);
+    }
+    fs.promises.unlink(xctestrunPath).catch(() => {});
+    fs.promises
+      .rm(resultBundlePath, { recursive: true, force: true })
+      .catch(() => {});
+  });
+
+  wdaProcessesByDeviceId.set(deviceId, trackedProcess);
+
+  const shutdownReason =
+    `xcodebuild launch stopped because the MCP server is shutting down. ` +
+    `Full log written to: ${logPath}`;
   const deadline = Date.now() + WDA_START_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    if (isServerCleaningUp) {
+      writeBoundedLogChunk(
+        logStream,
+        logState,
+        "\nxcodebuild launch stopped because the MCP server is shutting down\n"
+      );
+      await stopWdaXcodebuildProcess(deviceId);
+      return {
+        ok: false,
+        reason: shutdownReason,
+      };
+    }
+
+    if (spawnError) {
+      endLogStream(logStream);
+      await stopWdaXcodebuildProcess(deviceId);
+      return {
+        ok: false,
+        reason: `xcodebuild launch failed: ${describeCommandError(
+          spawnError
+        )}. Full log written to: ${logPath}`,
+      };
+    }
+
     if (await isWdaRunning(port)) {
       return { ok: true };
+    }
+
+    if (exitDescription) {
+      wdaProcessesByDeviceId.delete(deviceId);
+      fs.promises.unlink(xctestrunPath).catch(() => {});
+      return {
+        ok: false,
+        reason: `xcodebuild exited before WebDriverAgent became ready (${exitDescription}). Full log written to: ${logPath}`,
+      };
     }
 
     await sleep(WDA_STATUS_POLL_INTERVAL_MS);
   }
 
+  await stopWdaXcodebuildProcess(deviceId);
+
   return {
     ok: false,
     reason: `WebDriverAgent did not report ready on port ${port} within ${
       WDA_START_TIMEOUT_MS / 1000
-    } seconds`,
+    } seconds after xcodebuild launch. Full log written to: ${logPath}`,
   };
 }
 
 async function getWdaPortForSwipe(
+  deviceId: string,
+  restoreAppBundleId: string | undefined
+): Promise<WdaPortForSwipeResult> {
+  return withWdaLaunchLock(deviceId, () =>
+    getWdaPortForSwipeLocked(deviceId, restoreAppBundleId)
+  );
+}
+
+async function getWdaPortForSwipeLocked(
   deviceId: string,
   restoreAppBundleId: string | undefined
 ): Promise<WdaPortForSwipeResult> {
@@ -2125,7 +2933,6 @@ async function getWdaPortForSwipe(
   if (await isWdaRunning(port)) {
     try {
       await getVerifiedWdaDeviceIdForPort(port, deviceId);
-      return { port };
     } catch (error) {
       removeWdaPortMappings(port);
       return {
@@ -2135,13 +2942,8 @@ async function getWdaPortForSwipe(
         )}`,
       };
     }
-  }
 
-  if (!restoreAppBundleId) {
-    return {
-      port: null,
-      reason: `WebDriverAgent is not running on simulator ${deviceId}. Re-run with \`restore_app_bundle_id\` set to the exact app bundle identifier that should return to the foreground after WebDriverAgent launches.`,
-    };
+    return { port };
   }
 
   if (restoreAppBundleId === WDA_BUNDLE_ID) {
@@ -2151,18 +2953,36 @@ async function getWdaPortForSwipe(
     };
   }
 
+  if (!restoreAppBundleId) {
+    return {
+      port: null,
+      reason: `WebDriverAgent is not running on simulator ${deviceId}. Re-run with \`restore_app_bundle_id\` set to the exact app bundle identifier that should return to the foreground after WebDriverAgent launches.`,
+    };
+  }
+
   // Try launching WDA (it may already be installed)
   const initialLaunch = await launchWda(deviceId, port);
   if (initialLaunch.ok) {
     try {
       await getVerifiedWdaDeviceIdForPort(port, deviceId);
+    } catch (error) {
+      await stopWdaAfterSetupFailure(deviceId, port);
+      return {
+        port: null,
+        reason: `WebDriverAgent launch succeeded, but device verification after launch failed: ${describeCommandError(
+          error
+        )}`,
+      };
+    }
+
+    try {
       await restoreAppAfterWdaLaunch(deviceId, restoreAppBundleId);
       return { port };
     } catch (error) {
-      removeWdaPortMappings(port);
+      await stopWdaAfterSetupFailure(deviceId, port);
       return {
         port: null,
-        reason: `WebDriverAgent launch succeeded, but setup after launch failed: ${describeCommandError(
+        reason: `WebDriverAgent launch succeeded, but app restore after launch failed: ${describeCommandError(
           error
         )}`,
       };
@@ -2186,13 +3006,24 @@ async function getWdaPortForSwipe(
   if (relaunch.ok) {
     try {
       await getVerifiedWdaDeviceIdForPort(port, deviceId);
+    } catch (error) {
+      await stopWdaAfterSetupFailure(deviceId, port);
+      return {
+        port: null,
+        reason: `WebDriverAgent started after install, but device verification after launch failed: ${describeCommandError(
+          error
+        )}`,
+      };
+    }
+
+    try {
       await restoreAppAfterWdaLaunch(deviceId, restoreAppBundleId);
       return { port };
     } catch (error) {
-      removeWdaPortMappings(port);
+      await stopWdaAfterSetupFailure(deviceId, port);
       return {
         port: null,
-        reason: `WebDriverAgent started after install, but setup after launch failed: ${describeCommandError(
+        reason: `WebDriverAgent started after install, but app restore after launch failed: ${describeCommandError(
           error
         )}`,
       };
@@ -2449,7 +3280,7 @@ if (!isToolFiltered("ui_swipe_wda")) {
         .max(256)
         .optional()
         .describe(
-          "Required if WebDriverAgent must be launched; app bundle identifier to relaunch after WebDriverAgent starts so the tested app returns to the foreground"
+          "App bundle identifier to restore after WebDriverAgent is launched. Required when WebDriverAgent is not already running."
         ),
       udid: z
         .string()
@@ -2471,15 +3302,19 @@ if (!isToolFiltered("ui_swipe_wda")) {
       y_end,
     }) => {
       try {
+        const normalizedUdid = udid.toUpperCase();
         const swipeDurationMs = getSwipeDurationMs(duration);
         const { rawStartPoint, rawEndPoint } = await getRawSwipePoints(
-          udid,
+          normalizedUdid,
           x_start,
           y_start,
           x_end,
           y_end
         );
-        const wdaResult = await getWdaPortForSwipe(udid, restore_app_bundle_id);
+        const wdaResult = await getWdaPortForSwipe(
+          normalizedUdid,
+          restore_app_bundle_id
+        );
 
         if (wdaResult.port === null) {
           throw new Error(
@@ -2490,7 +3325,7 @@ if (!isToolFiltered("ui_swipe_wda")) {
         try {
           await performWdaSwipe(
             wdaResult.port,
-            udid,
+            normalizedUdid,
             rawStartPoint.x,
             rawStartPoint.y,
             rawEndPoint.x,
@@ -2510,7 +3345,7 @@ if (!isToolFiltered("ui_swipe_wda")) {
           content: [
             {
               type: "text",
-              text: `Swiped successfully using WebDriverAgent on simulator ${udid} via port ${wdaResult.port}`,
+              text: `Swiped successfully using WebDriverAgent on simulator ${normalizedUdid} via port ${wdaResult.port}`,
             },
           ],
         };
@@ -3496,12 +4331,38 @@ async function runServer() {
 
 runServer().catch(console.error);
 
-process.stdin.on("close", () => {
-  console.log("iOS Simulator MCP Server closed");
+let cleanupPromise: Promise<void> | null = null;
+
+async function cleanupServerOnce(): Promise<void> {
+  isServerCleaningUp = true;
+  await stopAllWdaXcodebuildProcesses();
+  wdaPortsByDeviceId.clear();
   server.close();
   try {
     fs.rmSync(TMP_ROOT_DIR, { recursive: true, force: true });
   } catch (error) {
     // Ignore cleanup errors
   }
+}
+
+function cleanupServer(): Promise<void> {
+  cleanupPromise ??= cleanupServerOnce();
+  return cleanupPromise;
+}
+
+process.once("exit", () => {
+  signalAllWdaXcodebuildProcesses();
+});
+
+process.once("SIGINT", () => {
+  cleanupServer().finally(() => process.exit(130));
+});
+
+process.once("SIGTERM", () => {
+  cleanupServer().finally(() => process.exit(143));
+});
+
+process.stdin.on("close", async () => {
+  console.log("iOS Simulator MCP Server closed");
+  await cleanupServer();
 });
