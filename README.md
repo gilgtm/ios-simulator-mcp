@@ -109,9 +109,8 @@ This project has been featured and mentioned in various publications and resourc
    */
   duration?: string;
   /**
-   * Required if WebDriverAgent must be launched; app bundle identifier to
-   * relaunch after WebDriverAgent starts so the tested app returns to the
-   * foreground
+   * App bundle identifier to restore after WebDriverAgent is launched.
+   * Required when WebDriverAgent is not already running.
    */
   restore_app_bundle_id?: string;
   /**
@@ -509,6 +508,7 @@ Claude Code CLI can manage MCP servers using the `claude mcp` commands or by edi
 | `IOS_SIMULATOR_MCP_FILTERED_TOOLS`     | A comma-separated list of tool names to filter out from being registered.                                                                                                                            | `screenshot,record_video,stop_recording` |
 | `IOS_SIMULATOR_MCP_DEFAULT_OUTPUT_DIR` | Specifies a default directory for output files like screenshots and video recordings. If not set, `~/Downloads` will be used. This can be handy if your agent has limited access to the file system. | `~/Code/awesome-project/tmp`             |
 | `IOS_SIMULATOR_MCP_IDB_PATH`           | Specifies a custom path to the IDB executable. If not set, `idb` will be used (assuming it's in your PATH). Useful if IDB is installed in a non-standard location.                                   | `~/bin/idb` or `/usr/local/bin/idb`      |
+| `IOS_SIMULATOR_MCP_WDA_PORT`           | Specifies the first WebDriverAgent HTTP port to try. Defaults to `8100` when unset. Must be from `1024` through `64535` so WebDriverAgent can bind as the current user and its MJPEG port (`+1000`) is also valid. Invalid values are reported by `ui_swipe_wda`. | `8123`                                   |
 
 #### Configuration Example
 
